@@ -1,0 +1,242 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  CUSTOMER
+  ADMIN
+}
+
+enum OrderStatus {
+  PENDING_PAYMENT
+  PROCESSING
+  OUT_FOR_DELIVERY
+  DELIVERED
+  CANCELLED
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+}
+
+enum DeliveryPartner {
+  KWIK
+}
+
+enum DeliveryStatus {
+  CREATED
+  ASSIGNED
+  PICKED_UP
+  IN_TRANSIT
+  DELIVERED
+  FAILED
+}
+
+enum DiscountType {
+  PERCENTAGE
+  FIXED
+}
+
+enum LeadStatus {
+  NEW
+  CONTACTED
+  CLOSED
+}
+
+enum VariantUnit {
+  PIECE
+  KG
+  PAINT
+  HALF_PAINT
+  BASKET
+}
+
+model User {
+  id             String    @id @default(uuid())
+  name           String
+  email          String?   @unique
+  phone          String    @unique
+  passwordHash   String
+  role           UserRole  @default(CUSTOMER)
+
+  faceImageUrl   String?
+  isFaceCaptured Boolean   @default(false)
+  isFaceVerified Boolean   @default(false)
+
+  orders         Order[]
+
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([phone])
+  @@index([email])
+}
+
+model Product {
+  id           String           @id @default(uuid())
+  name         String
+  slug         String           @unique
+  description  String?
+
+  // Main category group: e.g. "RICE", "YAM", "TOMATO"
+  category     String
+
+  // Sub-type under category: e.g. "OFADA", "BASMATI", "LOCAL", etc.
+  subCategory  String?
+
+  imageUrl     String?
+  isActive     Boolean          @default(true)
+  isFeatured   Boolean          @default(false)
+
+  variants     ProductVariant[]
+  orderItems   OrderItem[]
+
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+
+  @@index([category])
+  @@index([subCategory])
+  @@index([isFeatured])
+}
+
+model ProductVariant {
+  id            String      @id @default(uuid())
+  product       Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
+  productId     String
+
+  // e.g. "Small", "Medium", "Large", "Full Basket", "1 Paint", "Half Paint", "1kg"
+  name          String
+
+  // NEW: unit type
+  unit          VariantUnit @default(PIECE)
+
+  // Optional. Only meaningful if unit = KG (or if you want to store an estimate)
+  unitWeightKg  Float?
+
+  priceNgn      Int
+  stockQty      Int?
+
+  orderItems    OrderItem[]
+
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([productId])
+  @@index([unit])
+}
+
+model Order {
+  id                  String          @id @default(uuid())
+  orderNumber         String          @unique
+
+  user                User?           @relation(fields: [userId], references: [id])
+  userId              String?
+
+  status              OrderStatus     @default(PENDING_PAYMENT)
+  paymentStatus       PaymentStatus   @default(PENDING)
+  totalAmountNgn      Int
+  deliveryFeeNgn      Int
+  paymentReference    String?
+
+  deliveryAddress1    String
+  deliveryAddress2    String?
+  city                String
+  state               String
+  deliveryNote        String?
+  deliveryEstimate    DateTime?
+
+  deliveryPartner     DeliveryPartner @default(KWIK)
+  kwikOrderId         String?
+  kwikTrackingUrl     String?
+  deliveryStatus      DeliveryStatus?
+
+  faceCaptureImageUrl String?
+  faceCaptureAt       DateTime?
+
+  items               OrderItem[]
+
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  @@index([userId])
+  @@index([status])
+  @@index([paymentStatus])
+}
+
+model OrderItem {
+  id               String          @id @default(uuid())
+  order            Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  orderId          String
+
+  product          Product         @relation(fields: [productId], references: [id])
+  productId        String
+
+  productVariant   ProductVariant? @relation(fields: [productVariantId], references: [id])
+  productVariantId String?
+
+  quantity         Int
+  unitPriceNgn     Int
+  subtotalNgn      Int
+
+  createdAt        DateTime        @default(now())
+}
+
+model Discount {
+  id             String       @id @default(uuid())
+  title          String
+  description    String?
+
+  type           DiscountType
+  percentageOff  Int?
+  fixedAmountOff Int?
+
+  appliesToAll   Boolean      @default(false)
+  productIds     Json?
+
+  isActive       Boolean      @default(false)
+  startsAt       DateTime?
+  endsAt         DateTime?
+
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  @@index([isActive])
+  @@index([startsAt])
+  @@index([endsAt])
+}
+
+model B2BLead {
+  id               String     @id @default(uuid())
+  businessName     String
+  contactPerson    String
+  email            String?
+  phone            String
+  message          String?
+  estMonthlyVolume String?
+
+  status           LeadStatus @default(NEW)
+
+  createdAt        DateTime   @default(now())
+
+  @@index([status])
+  @@index([phone])
+}
+
+model SiteSettings {
+  id             Int      @id @default(1)
+  companyEmail   String
+  companyPhone   String
+  whatsappNumber String?
+  address        String?
+
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}
