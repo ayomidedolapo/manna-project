@@ -3,8 +3,10 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  // Optional but recommended for Neon:
+  directUrl = env("DIRECT_URL")
 }
 
 enum UserRole {
@@ -27,6 +29,11 @@ enum PaymentStatus {
   REFUNDED
 }
 
+enum PaymentProvider {
+  PAYSTACK
+  FLUTTERWAVE
+}
+
 enum DeliveryPartner {
   KWIK
 }
@@ -38,6 +45,17 @@ enum DeliveryStatus {
   IN_TRANSIT
   DELIVERED
   FAILED
+  CANCELLED
+}
+
+enum DeliveryProcessingStatus {
+  PENDING
+  QUEUED
+  READY_FOR_DISPATCH
+  DISPATCHED
+  DELIVERED
+  FAILED
+  CANCELLED
 }
 
 enum DiscountType {
@@ -60,47 +78,50 @@ enum VariantUnit {
 }
 
 model User {
-  id             String    @id @default(uuid())
-  name           String
-  email          String?   @unique
-  phone          String    @unique
-  passwordHash   String
-  role           UserRole  @default(CUSTOMER)
+  id           String   @id @default(uuid())
+  name         String
+  email        String?  @unique
+  phone        String   @unique
+  passwordHash String
+  role         UserRole @default(CUSTOMER)
 
   faceImageUrl   String?
-  isFaceCaptured Boolean   @default(false)
-  isFaceVerified Boolean   @default(false)
+  isFaceCaptured Boolean @default(false)
+  isFaceVerified Boolean @default(false)
 
-  orders         Order[]
+  orders Order[]
 
-  createdAt      DateTime  @default(now())
-  updatedAt      DateTime  @updatedAt
+  // ✅ persistent cart (1 cart per user)
+  cart Cart?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@index([phone])
   @@index([email])
 }
 
 model Product {
-  id           String           @id @default(uuid())
-  name         String
-  slug         String           @unique
-  description  String?
+  id          String  @id @default(uuid())
+  name        String
+  slug        String  @unique
+  description String?
 
-  // Main category group: e.g. "RICE", "YAM", "TOMATO"
-  category     String
+  category    String
+  subCategory String?
 
-  // Sub-type under category: e.g. "OFADA", "BASMATI", "LOCAL", etc.
-  subCategory  String?
+  imageUrl   String?
+  isActive   Boolean @default(true)
+  isFeatured Boolean @default(false)
 
-  imageUrl     String?
-  isActive     Boolean          @default(true)
-  isFeatured   Boolean          @default(false)
+  variants   ProductVariant[]
+  orderItems OrderItem[]
 
-  variants     ProductVariant[]
-  orderItems   OrderItem[]
+  // ✅ cart items
+  cartItems CartItem[]
 
-  createdAt    DateTime         @default(now())
-  updatedAt    DateTime         @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@index([category])
   @@index([subCategory])
@@ -108,105 +129,208 @@ model Product {
 }
 
 model ProductVariant {
-  id            String      @id @default(uuid())
-  product       Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
-  productId     String
+  id        String  @id @default(uuid())
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  productId String
 
-  // e.g. "Small", "Medium", "Large", "Full Basket", "1 Paint", "Half Paint", "1kg"
-  name          String
+  name         String
+  unit         VariantUnit @default(PIECE)
+  unitWeightKg Float?
 
-  // NEW: unit type
-  unit          VariantUnit @default(PIECE)
+  priceNgn Int
+  stockQty Int?
 
-  // Optional. Only meaningful if unit = KG (or if you want to store an estimate)
-  unitWeightKg  Float?
+  orderItems OrderItem[]
 
-  priceNgn      Int
-  stockQty      Int?
+  // ✅ cart items
+  cartItems CartItem[]
 
-  orderItems    OrderItem[]
-
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@index([productId])
   @@index([unit])
 }
 
 model Order {
-  id                  String          @id @default(uuid())
-  orderNumber         String          @unique
+  id          String  @id @default(uuid())
+  orderNumber String  @unique
+  user        User?   @relation(fields: [userId], references: [id])
+  userId      String?
 
-  user                User?           @relation(fields: [userId], references: [id])
-  userId              String?
+  status        OrderStatus   @default(PENDING_PAYMENT)
+  paymentStatus PaymentStatus @default(PENDING)
 
-  status              OrderStatus     @default(PENDING_PAYMENT)
-  paymentStatus       PaymentStatus   @default(PENDING)
-  totalAmountNgn      Int
-  deliveryFeeNgn      Int
-  paymentReference    String?
+  totalAmountNgn Int
+  deliveryFeeNgn Int
 
-  deliveryAddress1    String
-  deliveryAddress2    String?
-  city                String
-  state               String
-  deliveryNote        String?
-  deliveryEstimate    DateTime?
+  paymentProvider  PaymentProvider?
+  paymentReference String?
+  paidAt           DateTime?
 
-  deliveryPartner     DeliveryPartner @default(KWIK)
-  kwikOrderId         String?
-  kwikTrackingUrl     String?
-  deliveryStatus      DeliveryStatus?
+  deliveryAddress1 String
+  deliveryAddress2 String?
+  city             String
+  state            String
+  deliveryNote     String?
+  deliveryEstimate DateTime?
+
+  deliveryLat Float?
+  deliveryLng Float?
+
+  deliveryPartner DeliveryPartner @default(KWIK)
 
   faceCaptureImageUrl String?
   faceCaptureAt       DateTime?
 
-  items               OrderItem[]
+  invoiceNumber   String?   @unique
+  invoiceIssuedAt DateTime?
+  receiptSentAt   DateTime?
+  receiptEmailTo  String?
 
-  createdAt           DateTime @default(now())
-  updatedAt           DateTime @updatedAt
+  // ✅ NEW: weight snapshot for ops/audit (optional but very useful)
+  totalWeightKg Float?
+
+  items    OrderItem[]
+  delivery Delivery?
+  payments PaymentAttempt[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@index([userId])
   @@index([status])
   @@index([paymentStatus])
 }
 
-model OrderItem {
-  id               String          @id @default(uuid())
-  order            Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
-  orderId          String
+model Delivery {
+  id      String @id @default(uuid())
+  order   Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  orderId String @unique
 
-  product          Product         @relation(fields: [productId], references: [id])
-  productId        String
+  partner DeliveryPartner @default(KWIK)
+  status  DeliveryStatus  @default(CREATED)
+
+  // ✅ ADD THESE HERE
+  processingStatus       DeliveryProcessingStatus @default(PENDING)
+  requiresManualDispatch Boolean                  @default(false)
+  scheduledDispatchAt    DateTime?
+  dispatchDeferredReason String?
+
+  kwikTaskId      String? @unique
+  kwikTrackingUrl String?
+  kwikRawResponse Json?
+
+  kwikUniqueOrderId    String?
+  kwikJobStatus        Int?
+  kwikStatusCheckUrl   String?
+  lastWebhookAt        DateTime?
+  lastStatusCheckAt    DateTime?
+  statusCheckAttempts  Int       @default(0)
+  nextStatusCheckAt    DateTime?
+  lastStatusCheckError String?
+
+  deliveredAt            DateTime?
+  kwikLastTerminalStatus Int?
+
+  // ✅ NEW: chosen vehicle for this delivery
+  kwikVehicleId    Int?
+  kwikVehicleLabel String? // BIKE | SUV | VAN
+  totalWeightKg    Float? // snapshot at dispatch time
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([processingStatus])
+  @@index([requiresManualDispatch])
+  @@index([scheduledDispatchAt])
+  @@index([kwikUniqueOrderId])
+  @@index([nextStatusCheckAt])
+}
+
+model DeliveryWebhookEvent {
+  id       String @id @default(cuid())
+  provider String @default("KWIK")
+
+  // Deduplication hash (webhook can retry)
+  dedupeHash String @unique
+
+  jobId         String?
+  uniqueOrderId String?
+  jobStatus     Int?
+
+  payload     Json
+  receivedAt  DateTime  @default(now())
+  processedAt DateTime?
+  status      String    @default("RECEIVED") // RECEIVED | PROCESSED | FAILED
+  error       String?
+
+  @@index([jobId])
+  @@index([uniqueOrderId])
+  @@index([status])
+}
+
+model PaymentAttempt {
+  id String @id @default(uuid())
+
+  order   Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  orderId String
+
+  provider  PaymentProvider
+  reference String          @unique
+  status    PaymentStatus   @default(PENDING)
+
+  amountNgn Int
+  currency  String @default("NGN")
+
+  rawInit   Json?
+  rawVerify Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([orderId])
+  @@index([provider])
+  @@index([status])
+}
+
+model OrderItem {
+  id      String @id @default(uuid())
+  order   Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  orderId String
+
+  product   Product @relation(fields: [productId], references: [id])
+  productId String
 
   productVariant   ProductVariant? @relation(fields: [productVariantId], references: [id])
   productVariantId String?
 
-  quantity         Int
-  unitPriceNgn     Int
-  subtotalNgn      Int
+  quantity     Int
+  unitPriceNgn Int
+  subtotalNgn  Int
 
-  createdAt        DateTime        @default(now())
+  createdAt DateTime @default(now())
 }
 
 model Discount {
-  id             String       @id @default(uuid())
-  title          String
-  description    String?
+  id          String  @id @default(uuid())
+  title       String
+  description String?
 
   type           DiscountType
   percentageOff  Int?
   fixedAmountOff Int?
 
-  appliesToAll   Boolean      @default(false)
-  productIds     Json?
+  appliesToAll Boolean @default(false)
+  productIds   Json?
 
-  isActive       Boolean      @default(false)
-  startsAt       DateTime?
-  endsAt         DateTime?
+  isActive Boolean   @default(false)
+  startsAt DateTime?
+  endsAt   DateTime?
 
-  createdAt      DateTime     @default(now())
-  updatedAt      DateTime     @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@index([isActive])
   @@index([startsAt])
@@ -214,7 +338,7 @@ model Discount {
 }
 
 model B2BLead {
-  id               String     @id @default(uuid())
+  id               String  @id @default(uuid())
   businessName     String
   contactPerson    String
   email            String?
@@ -222,21 +346,66 @@ model B2BLead {
   message          String?
   estMonthlyVolume String?
 
-  status           LeadStatus @default(NEW)
+  status LeadStatus @default(NEW)
 
-  createdAt        DateTime   @default(now())
+  createdAt DateTime @default(now())
 
   @@index([status])
   @@index([phone])
 }
 
 model SiteSettings {
-  id             Int      @id @default(1)
+  id             Int     @id @default(1)
   companyEmail   String
   companyPhone   String
   whatsappNumber String?
   address        String?
 
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+//
+// ✅ Persistent Cart
+// - 1 cart per user (userId is unique on Cart)
+// - Prevent duplicates via unique constraint (cartId + productId + productVariantId)
+//
+model Cart {
+  id String @id @default(uuid())
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId String @unique
+
+  items CartItem[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+}
+
+model CartItem {
+  id String @id @default(uuid())
+
+  cart   Cart   @relation(fields: [cartId], references: [id], onDelete: Cascade)
+  cartId String
+
+  product   Product @relation(fields: [productId], references: [id])
+  productId String
+
+  productVariant   ProductVariant? @relation(fields: [productVariantId], references: [id])
+  productVariantId String?
+
+  quantity Int @default(1)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // ✅ prevents duplicates for same product+variant in same cart
+  // Note: Postgres allows multiple NULLs in unique constraints,
+  // so variant=null rows may still duplicate. We'll handle that in API with upsert logic.
+  @@unique([cartId, productId, productVariantId])
+  @@index([cartId])
+  @@index([productId])
+  @@index([productVariantId])
 }

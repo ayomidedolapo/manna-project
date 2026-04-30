@@ -3,12 +3,28 @@ import { jwtVerify } from "jose";
 
 const COOKIE_NAME = "manna_token";
 
+// ✅ Explicit bypass list (these routes self-protect using secret or are intended public)
+function isBypassedApiRoute(pathname: string) {
+  // KWIK webhook receiver (your route verifies secret header/query)
+  if (pathname === "/api/webhooks/kwik") return true;
+
+  // Cron sync endpoint (your route verifies ?secret=)
+  if (pathname === "/api/cron/kwik-sync") return true;
+
+  // Tracking endpoint should be accessible without auth (or you can secure it inside route)
+  // Matches: /api/orders/:orderId/tracking
+  if (pathname.startsWith("/api/orders/") && pathname.endsWith("/tracking")) return true;
+
+  return false;
+}
+
 function isAdminRoute(pathname: string) {
   return pathname.startsWith("/admin") || pathname.startsWith("/api/admin");
 }
 
 function isAuthRoute(pathname: string) {
   // pages/routes that require login (add/remove as you like)
+  // ⚠️ IMPORTANT: tracking route is bypassed above, so it won't get blocked here.
   return (
     pathname.startsWith("/api/orders") ||
     pathname.startsWith("/api/my") ||
@@ -38,6 +54,11 @@ export async function middleware(req: NextRequest) {
 
   // Skip Next internals
   if (pathname.startsWith("/_next") || pathname.startsWith("/favicon.ico")) {
+    return NextResponse.next();
+  }
+
+  // ✅ BYPASS: allow webhook/cron/tracking without JWT cookie
+  if (isBypassedApiRoute(pathname)) {
     return NextResponse.next();
   }
 

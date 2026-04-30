@@ -1,137 +1,151 @@
-import { NextResponse } from "next/server"
-import { prisma } from "@/lib/prisma"
-import { getActiveDiscounts, applyDiscountToAmount } from "@/services/discount.service"
+import { NextResponse } from "next/server";
+import { cookies } from "next/headers";
+import { z } from "zod";
+import { customAlphabet } from "nanoid";
+import { prisma } from "@/lib/prisma";
+import { verifyAuthToken } from "@/lib/auth";
+import { priceCart } from "@/lib/checkout/priceCart";
 
-type CheckoutItem = {
-  productVariantId: string
-  quantity: number
-}
+const nanoid = customAlphabet("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ", 10);
 
-type CheckoutBody = {
-  userId?: string
-  items: CheckoutItem[]
-  deliveryFeeNgn: number
-  deliveryAddress1: string
-  deliveryAddress2?: string
-  city: string
-  state: string
-  deliveryNote?: string
-}
+const BodySchema = z.object({
+  items: z
+    .array(
+      z.object({
+        variantId: z.string().uuid(),
+        quantity: z.number().int().min(1),
+      })
+    )
+    .min(1),
+
+  // Delivery details
+  deliveryFeeNgn: z.number().int().min(0).optional(), // MVP can be 0
+  deliveryAddress1: z.string().min(3),
+  deliveryAddress2: z.string().optional(),
+  city: z.string().min(2),
+  state: z.string().min(2),
+  deliveryNote: z.string().optional(),
+
+  // Optional coords for KWIK later
+  deliveryLat: z.number().optional(),
+  deliveryLng: z.number().optional(),
+});
 
 function makeOrderNumber() {
-  // Simple unique-ish order number (you can replace later)
-  return `MN-${Date.now()}`
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `MAN-${y}${m}${day}-${nanoid()}`;
 }
 
 export async function POST(req: Request) {
   try {
-    const body = (await req.json()) as CheckoutBody
+    const body = BodySchema.parse(await req.json());
 
-    if (!body.items?.length) {
-      return NextResponse.json({ error: "No items provided" }, { status: 400 })
+    // ✅ Auth from cookie (don’t accept userId from body)
+    const cookieStore = await cookies();
+    const token = cookieStore.get("manna_token")?.value;
+
+    let userId: string | null = null;
+    if (token) {
+      const decoded = verifyAuthToken(token);
+      if (decoded?.userId) userId = decoded.userId;
     }
 
-    if (!body.deliveryAddress1 || !body.city || !body.state) {
-      return NextResponse.json({ error: "Delivery address is incomplete" }, { status: 400 })
-    }
+    // 1) Server pricing (discount-aware + stock check inside)
+    const pricing = await priceCart(body.items);
 
-    // 1) Load variants and compute total from DB prices (never trust client)
-    const variantIds = body.items.map((i) => i.productVariantId)
+    // 2) Delivery fee (MVP; later compute from KWIK)
+    const deliveryFeeNgn = Math.max(Number(body.deliveryFeeNgn ?? 0), 0);
 
-    const variants = await prisma.productVariant.findMany({
-      where: { id: { in: variantIds } },
-      include: { product: true },
-    })
-
-    const variantMap = new Map(variants.map((v) => [v.id, v]))
-
-    const orderItems = body.items.map((i) => {
-      const v = variantMap.get(i.productVariantId)
-      if (!v) throw new Error(`Variant not found: ${i.productVariantId}`)
-      if (i.quantity <= 0) throw new Error(`Invalid quantity for variant: ${i.productVariantId}`)
-
-      const unitPriceNgn = v.priceNgn
-      const subtotalNgn = unitPriceNgn * i.quantity
-
-      return {
-        productId: v.productId,
-        productVariantId: v.id,
-        quantity: i.quantity,
-        unitPriceNgn,
-        subtotalNgn,
-      }
-    })
-
-    const itemsTotalNgn = orderItems.reduce((sum, it) => sum + it.subtotalNgn, 0)
-
-    // 2) Pick the active discount campaign (simple requirement)
-    const [discount] = await getActiveDiscounts()
-
-    // 3) Apply discount
-    // Your schema supports: appliesToAll OR productIds list
-    let discountedItemsTotalNgn = itemsTotalNgn
-
-    if (discount) {
-      if (discount.appliesToAll) {
-        discountedItemsTotalNgn = applyDiscountToAmount(itemsTotalNgn, discount)
-      } else if (discount.productIds) {
-        const eligibleProductIds = new Set<string>(discount.productIds as string[])
-
-        const eligibleAmount = orderItems
-          .filter((it) => eligibleProductIds.has(it.productId))
-          .reduce((sum, it) => sum + it.subtotalNgn, 0)
-
-        const discountedEligibleAmount = applyDiscountToAmount(eligibleAmount, discount)
-
-        // Replace only the eligible portion; keep non-eligible same
-        const nonEligibleAmount = itemsTotalNgn - eligibleAmount
-        discountedItemsTotalNgn = nonEligibleAmount + discountedEligibleAmount
-      }
-    }
-
-    const deliveryFeeNgn = Math.max(Number(body.deliveryFeeNgn || 0), 0)
-    const totalAmountNgn = discountedItemsTotalNgn + deliveryFeeNgn
-
-    // 4) Create order + items in a transaction
+    // 3) Create order + items (transaction)
     const order = await prisma.$transaction(async (tx) => {
+      // Re-check stock in-tx (race safety)
+      const variants = await tx.productVariant.findMany({
+        where: { id: { in: body.items.map((i) => i.variantId) } },
+        include: { product: true },
+      });
+
+      const vmap = new Map(variants.map((v) => [v.id, v]));
+
+      for (const ci of body.items) {
+        const v = vmap.get(ci.variantId);
+        if (!v) throw new Error("Variant not found");
+
+        if (v.stockQty !== null && v.stockQty !== undefined) {
+          if (v.stockQty < ci.quantity) {
+            throw new Error(`Insufficient stock for ${v.product.name} - ${v.name}`);
+          }
+        }
+      }
+
       const created = await tx.order.create({
         data: {
           orderNumber: makeOrderNumber(),
-          userId: body.userId ?? null,
-          totalAmountNgn,
+          userId,
+
+          status: "PENDING_PAYMENT",
+          paymentStatus: "PENDING",
+
+          totalAmountNgn: pricing.itemsTotalNgn + deliveryFeeNgn,
           deliveryFeeNgn,
+
           deliveryAddress1: body.deliveryAddress1,
           deliveryAddress2: body.deliveryAddress2 ?? null,
           city: body.city,
           state: body.state,
           deliveryNote: body.deliveryNote ?? null,
+
+          deliveryLat: body.deliveryLat ?? null,
+          deliveryLng: body.deliveryLng ?? null,
+
+          deliveryPartner: "KWIK",
+
           items: {
-            create: orderItems,
+            create: pricing.items.map((i) => ({
+              productId: i.productId,
+              productVariantId: i.variantId,
+              quantity: i.quantity,
+
+              // ✅ IMPORTANT: freeze discounted unit price
+              unitPriceNgn: i.finalUnitPriceNgn,
+              subtotalNgn: i.lineTotalNgn,
+            })),
           },
         },
         include: { items: true },
-      })
+      });
 
-      return created
-    })
-
-    return NextResponse.json({
-      orderId: order.id,
-      orderNumber: order.orderNumber,
-      itemsTotalNgn,
-      discountedItemsTotalNgn,
-      deliveryFeeNgn,
-      totalAmountNgn,
-      appliedDiscount: discount
-        ? { id: discount.id, title: discount.title, type: discount.type }
-        : null,
-    })
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : "Checkout failed"
+      return created;
+    });
 
     return NextResponse.json(
-      { error: message },
-      { status: 500 }
-    )
+      {
+        ok: true,
+        order: {
+          id: order.id,
+          orderNumber: order.orderNumber,
+          status: order.status,
+          paymentStatus: order.paymentStatus,
+        },
+        pricing: {
+          currency: pricing.currency,
+          totals: {
+            subtotalNgn: pricing.subtotalNgn,
+            discountTotalNgn: pricing.discountTotalNgn,
+            itemsTotalNgn: pricing.itemsTotalNgn,
+            deliveryFeeNgn,
+            totalAmountNgn: pricing.itemsTotalNgn + deliveryFeeNgn,
+          },
+          items: pricing.items,
+        },
+      },
+      { status: 201 }
+    );
+  } catch (err: unknown) {
+    const message =
+      err instanceof Error ? err.message : typeof err === "string" ? err : "Something went wrong";
+    return NextResponse.json({ ok: false, message }, { status: 400 });
   }
 }
