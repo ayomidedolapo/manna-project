@@ -7,19 +7,26 @@ import {
 
 type CartItemInput = { variantId: string; quantity: number };
 
-type AppliedDiscountSummary = {
-  id: string;
-  title: string;
-  type: string;
-  percentageOff: number | null;
-  fixedAmountOff: number | null;
-  appliesToAll: boolean;
-  productIds: unknown;
-  startsAt: Date | null;
-  endsAt: Date | null;
-};
+type Discount = NonNullable<Parameters<typeof applyDiscountDetailed>[1]>;
 
-function pickDiscountForProduct(discounts: any[], productId: string) {
+type AppliedDiscountSummary = Pick<
+  Discount,
+  | "id"
+  | "title"
+  | "description"
+  | "type"
+  | "percentageOff"
+  | "fixedAmountOff"
+  | "appliesToAll"
+  | "productIds"
+  | "isActive"
+  | "startsAt"
+  | "endsAt"
+  | "createdAt"
+  | "updatedAt"
+>;
+
+function pickDiscountForProduct(discounts: Discount[], productId: string) {
   // Priority: product-specific > global
   const productSpecific = discounts.find(
     (d) => !d.appliesToAll && isDiscountEligibleForProduct(d, productId)
@@ -72,8 +79,9 @@ export async function priceCart(items: CartItemInput[]) {
     // ✅ Pick discount by rule: product-specific > global
     const chosenDiscount = pickDiscountForProduct(discounts, v.productId);
 
+    // Pass the chosenDiscount directly (or null) to avoid unsafe any cast
     const { finalAmount: finalUnitPriceNgn, discountAmount: perUnitDiscountNgn } =
-      applyDiscountDetailed(unitPriceNgn, chosenDiscount);
+      applyDiscountDetailed(unitPriceNgn, chosenDiscount ?? null);
 
     const lineSubtotalNgn = unitPriceNgn * qty;
     const lineDiscountNgn = perUnitDiscountNgn * qty;
@@ -83,13 +91,17 @@ export async function priceCart(items: CartItemInput[]) {
       ? {
           id: chosenDiscount.id,
           title: chosenDiscount.title,
+          description: chosenDiscount.description,
           type: chosenDiscount.type,
           percentageOff: chosenDiscount.percentageOff,
           fixedAmountOff: chosenDiscount.fixedAmountOff,
           appliesToAll: chosenDiscount.appliesToAll,
           productIds: chosenDiscount.productIds,
+          isActive: chosenDiscount.isActive,
           startsAt: chosenDiscount.startsAt,
           endsAt: chosenDiscount.endsAt,
+          createdAt: chosenDiscount.createdAt,
+          updatedAt: chosenDiscount.updatedAt,
         }
       : null;
 

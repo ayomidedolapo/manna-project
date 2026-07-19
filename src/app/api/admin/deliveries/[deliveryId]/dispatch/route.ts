@@ -1,15 +1,16 @@
-import { NextResponse } from "next/server";
+import { NextResponse, type NextRequest } from "next/server";
 import { cookies } from "next/headers";
 import { prisma } from "@/lib/prisma";
 import { verifyAuthToken } from "@/lib/auth";
 import { createDeliveryFromOrder } from "@/lib/delivery/createDeliveryFromOrder";
 
 export async function POST(
-  req: Request,
-  { params }: { params: { deliveryId: string } }
+  _req: NextRequest,
+  { params }: { params: Promise<{ deliveryId: string }> }
 ) {
   try {
-    const cookieStore = cookies();
+    const { deliveryId } = await params;
+    const cookieStore = await cookies();
     const token = cookieStore.get("manna_token")?.value;
 
     if (!token) {
@@ -29,8 +30,14 @@ export async function POST(
     }
 
     const delivery = await prisma.delivery.findUnique({
-      where: { id: params.deliveryId },
-      include: { order: true },
+      where: { id: deliveryId },
+      select: {
+        id: true,
+        orderId: true,
+        processingStatus: true,
+        requiresManualDispatch: true,
+        kwikTaskId: true,
+      },
     });
 
     if (!delivery) {
@@ -40,7 +47,16 @@ export async function POST(
       );
     }
 
-    // Prevent dispatching if already dispatched
+    if (delivery.kwikTaskId) {
+      return NextResponse.json(
+        {
+          ok: false,
+          message: "Delivery has already been dispatched",
+        },
+        { status: 409 }
+      );
+    }
+
     if (delivery.processingStatus !== "QUEUED") {
       return NextResponse.json(
         {
@@ -61,9 +77,13 @@ export async function POST(
       );
     }
 
-    // Update status first (safety)
-    await prisma.delivery.update({
-      where: { id: delivery.id },
+    const claimed = await prisma.delivery.updateMany({
+      where: {
+        id: delivery.id,
+        kwikTaskId: null,
+        processingStatus: "QUEUED",
+        requiresManualDispatch: true,
+      },
       data: {
         processingStatus: "READY_FOR_DISPATCH",
         requiresManualDispatch: false,
@@ -72,13 +92,22 @@ export async function POST(
       },
     });
 
-    // Trigger KWIK delivery creation
-    await createDeliveryFromOrder(delivery.orderId);
+    if (claimed.count !== 1) {
+      return NextResponse.json(
+        {
+          ok: false,
+          message: "Delivery dispatch is already being processed",
+        },
+        { status: 409 }
+      );
+    }
+
+    const dispatchedDelivery = await createDeliveryFromOrder(delivery.orderId);
 
     return NextResponse.json({
       ok: true,
       message: "Delivery dispatched successfully",
-      deliveryId: delivery.id,
+      deliveryId: dispatchedDelivery.id,
       orderId: delivery.orderId,
     });
   } catch (err: unknown) {
@@ -86,8 +115,8 @@ export async function POST(
       err instanceof Error
         ? err.message
         : typeof err === "string"
-        ? err
-        : "Something went wrong";
+          ? err
+          : "Something went wrong";
 
     return NextResponse.json(
       { ok: false, message },

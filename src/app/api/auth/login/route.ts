@@ -31,6 +31,13 @@ export async function POST(req: Request) {
       );
     }
 
+    if (!user.passwordHash) {
+      return NextResponse.json(
+        { message: "Use Google or Apple sign-in for this account" },
+        { status: 401 }
+      );
+    }
+
     const valid = await verifyPassword(password, user.passwordHash);
 
     if (!valid) {

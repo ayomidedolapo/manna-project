@@ -1,5 +1,5 @@
 // src/app/api/payments/initialize/route.ts
-import { NextResponse } from "next/server";
+import { NextResponse, type NextRequest } from "next/server";
 import { cookies } from "next/headers";
 import { z } from "zod";
 import { customAlphabet } from "nanoid";
@@ -14,6 +14,30 @@ const nanoid = customAlphabet("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ", 14);
 const BodySchema = z.object({
   orderId: z.string().uuid(),
 });
+
+type OrderForPayment = {
+  id: string;
+  userId: string | null;
+  status: string;
+  paymentStatus: string;
+  totalAmountNgn: number;
+  deliveryFeeNgn: number;
+  orderNumber: string;
+  paymentReference: string | null;
+  deliveryQuoteId: string | null;
+  deliveryQuoteExpiresAt: Date | null;
+  marketClusterId: string | null;
+};
+
+type DeliveryQuoteForPayment = {
+  id: string;
+  userId: string | null;
+  orderId: string | null;
+  marketClusterId: string;
+  status: string;
+  quoteExpiresAt: Date;
+  amountToChargeCustomerNgn: number;
+};
 
 function makePaymentReference() {
   const d = new Date();
@@ -34,12 +58,61 @@ function getPaystackSecret() {
   return { secret, mode };
 }
 
-export async function POST(req: Request) {
+async function validateDeliveryQuoteBeforePayment(order: OrderForPayment, userId: string) {
+  if (!order.deliveryQuoteId) {
+    throw new Error("Create a valid Kwik delivery quote before initializing payment");
+  }
+
+  const quote = (await prisma.deliveryQuote.findUnique({
+    where: { id: order.deliveryQuoteId },
+    select: {
+      id: true,
+      userId: true,
+      orderId: true,
+      marketClusterId: true,
+      status: true,
+      quoteExpiresAt: true,
+      amountToChargeCustomerNgn: true,
+    },
+  })) as DeliveryQuoteForPayment | null;
+
+  if (!quote) {
+    throw new Error("Delivery quote not found. Request a new quote.");
+  }
+
+  if (quote.userId !== userId) {
+    throw new Error("Delivery quote does not belong to this customer");
+  }
+
+  if (quote.orderId !== order.id) {
+    throw new Error("Delivery quote is not locked to this order");
+  }
+
+  if (quote.status !== "USED") {
+    throw new Error("Delivery quote is not locked for payment");
+  }
+
+  if (quote.quoteExpiresAt.getTime() <= Date.now()) {
+    throw new Error("Delivery quote has expired. Request a new quote before payment.");
+  }
+
+  if (order.deliveryQuoteExpiresAt && order.deliveryQuoteExpiresAt.getTime() <= Date.now()) {
+    throw new Error("Order delivery quote has expired. Request a new quote before payment.");
+  }
+
+  if (order.marketClusterId !== quote.marketClusterId) {
+    throw new Error("Order market cluster does not match the delivery quote");
+  }
+
+  if (order.deliveryFeeNgn !== quote.amountToChargeCustomerNgn) {
+    throw new Error("Order delivery fee no longer matches the Kwik quote");
+  }
+}
+
+export async function POST(req: NextRequest) {
   try {
-    // ✅ If request has no JSON body, this will throw
     const body = BodySchema.parse(await req.json());
 
-    // Auth
     const cookieStore = await cookies();
     const token = cookieStore.get("manna_token")?.value;
     const decoded = token ? verifyAuthToken(token) : null;
@@ -48,7 +121,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: false, message: "Unauthorized" }, { status: 401 });
     }
 
-    const order = await prisma.order.findUnique({
+    const order = (await prisma.order.findUnique({
       where: { id: body.orderId },
       select: {
         id: true,
@@ -56,16 +129,20 @@ export async function POST(req: Request) {
         status: true,
         paymentStatus: true,
         totalAmountNgn: true,
+        deliveryFeeNgn: true,
         orderNumber: true,
         paymentReference: true,
+        deliveryQuoteId: true,
+        deliveryQuoteExpiresAt: true,
+        marketClusterId: true,
       },
-    });
+    })) as OrderForPayment | null;
 
     if (!order) {
       return NextResponse.json({ ok: false, message: "Order not found" }, { status: 404 });
     }
 
-    const isOwner = order.userId && order.userId === decoded.userId;
+    const isOwner = order.userId === decoded.userId;
     const isAdmin = decoded.role === "ADMIN";
     if (!isOwner && !isAdmin) {
       return NextResponse.json({ ok: false, message: "Forbidden" }, { status: 403 });
@@ -85,7 +162,8 @@ export async function POST(req: Request) {
       );
     }
 
-    // Ensure payment reference exists
+    await validateDeliveryQuoteBeforePayment(order, decoded.userId);
+
     const paymentReference = order.paymentReference ?? makePaymentReference();
 
     const updated = await prisma.order.update({
@@ -100,10 +178,8 @@ export async function POST(req: Request) {
       },
     });
 
-    // Paystack secret
     const { secret, mode } = getPaystackSecret();
 
-    // ✅ Paystack needs a valid email
     const user = updated.userId
       ? await prisma.user.findUnique({
           where: { id: updated.userId },
@@ -111,20 +187,19 @@ export async function POST(req: Request) {
         })
       : null;
 
-    const email = user?.email && user.email.includes("@")
-      ? user.email
-      : "test@manna.com"; // ✅ valid fallback
+    const email = user?.email && user.email.includes("@") ? user.email : "test@manna.com";
 
     const paystackRes = await axios.post(
       "https://api.paystack.co/transaction/initialize",
       {
         reference: updated.paymentReference,
-        amount: updated.totalAmountNgn * 100, // kobo
+        amount: updated.totalAmountNgn * 100,
         email,
         currency: "NGN",
         metadata: {
           orderId: updated.id,
           orderNumber: updated.orderNumber,
+          deliveryQuoteId: order.deliveryQuoteId,
           mode,
         },
       },
@@ -154,14 +229,10 @@ export async function POST(req: Request) {
       { status: 200 }
     );
   } catch (err: unknown) {
-    // ✅ Show Paystack’s real error message if axios fails
     if (axios.isAxiosError(err)) {
       const ax = err as AxiosError<{ message?: string; error?: string }>;
       const status = ax.response?.status ?? 400;
-      const paystackMessage =
-        ax.response?.data?.message ??
-        ax.response?.data?.error ??
-        ax.message;
+      const paystackMessage = ax.response?.data?.message ?? ax.response?.data?.error ?? ax.message;
 
       return NextResponse.json(
         { ok: false, message: `Paystack error: ${paystackMessage}` },
@@ -169,13 +240,12 @@ export async function POST(req: Request) {
       );
     }
 
-    // Zod errors come here too
     const message =
       err instanceof Error
         ? err.message
         : typeof err === "string"
-        ? err
-        : "Something went wrong";
+          ? err
+          : "Something went wrong";
 
     return NextResponse.json({ ok: false, message }, { status: 400 });
   }

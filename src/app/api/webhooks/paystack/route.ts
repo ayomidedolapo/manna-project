@@ -1,13 +1,35 @@
 import crypto from "crypto";
-import { NextResponse } from "next/server";
+import { NextResponse, type NextRequest } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { createDeliveryFromOrder } from "@/lib/delivery/createDeliveryFromOrder";
 import {
   isWithinDeliveryWindow,
   getNextDeliveryWindowStart,
 } from "@/lib/delivery/deliveryWindow";
+import { createVendorOrdersForPaidMarketplaceOrder } from "@/lib/marketplace/vendorOrders";
 
 export const runtime = "nodejs";
+
+type ProductVariantForPayment = {
+  id: string;
+  name: string;
+  stockQty: number | null;
+};
+
+type OrderItemForPayment = {
+  quantity: number;
+  productVariant: ProductVariantForPayment | null;
+  product: {
+    name: string;
+  } | null;
+};
+
+type OrderForPaymentWebhook = {
+  id: string;
+  paymentStatus: string;
+  deliveryQuoteId: string | null;
+  items: OrderItemForPayment[];
+};
 
 function getPaystackSecret() {
   const mode = process.env.PAYSTACK_MODE ?? "test";
@@ -27,50 +49,57 @@ function verifyPaystackSignature(rawBody: string, signature: string | null) {
   if (!signature) return false;
 
   const secret = getPaystackSecret();
-
-  const hash = crypto
-    .createHmac("sha512", secret)
-    .update(rawBody)
-    .digest("hex");
+  const hash = crypto.createHmac("sha512", secret).update(rawBody).digest("hex");
 
   return hash === signature;
 }
 
-export async function POST(req: Request) {
+async function markMarketplaceOrderReadyForVendorPreparation(orderId: string) {
+  await prisma.delivery.upsert({
+    where: { orderId },
+    update: {
+      processingStatus: "QUEUED",
+      requiresManualDispatch: false,
+      scheduledDispatchAt: null,
+      dispatchDeferredReason: "WAITING_FOR_VENDOR_READY",
+    },
+    create: {
+      orderId,
+      partner: "KWIK",
+      status: "CREATED",
+      processingStatus: "QUEUED",
+      requiresManualDispatch: false,
+      dispatchDeferredReason: "WAITING_FOR_VENDOR_READY",
+    },
+  });
+}
+
+async function prepareMarketplaceOrderForVendors(orderId: string) {
+  await markMarketplaceOrderReadyForVendorPreparation(orderId);
+  return createVendorOrdersForPaidMarketplaceOrder(orderId);
+}
+
+export async function POST(req: NextRequest) {
   try {
-    console.log("🔔 PAYSTACK WEBHOOK HIT");
-
-    // IMPORTANT: Read raw body exactly once
     const rawBody = await req.text();
-
     const signature = req.headers.get("x-paystack-signature");
-    console.log("Signature present:", !!signature);
 
     if (!verifyPaystackSignature(rawBody, signature)) {
-      console.log("❌ Invalid Paystack signature");
       return NextResponse.json(
         { ok: false, message: "Invalid signature" },
         { status: 401 }
       );
     }
 
-    console.log("✅ Signature verified");
+    const event: unknown = JSON.parse(rawBody);
+    const eventRecord = event as { event?: unknown; data?: { reference?: unknown } };
 
-    const event = JSON.parse(rawBody);
-
-    console.log("Event type:", event?.event);
-
-    if (event?.event !== "charge.success") {
-      console.log("Ignored event:", event?.event);
-      return NextResponse.json(
-        { ok: true, message: "Ignored event" },
-        { status: 200 }
-      );
+    if (eventRecord.event !== "charge.success") {
+      return NextResponse.json({ ok: true, message: "Ignored event" }, { status: 200 });
     }
 
-    const reference: string | undefined = event?.data?.reference;
-
-    console.log("Payment reference:", reference);
+    const reference =
+      typeof eventRecord.data?.reference === "string" ? eventRecord.data.reference : null;
 
     if (!reference) {
       return NextResponse.json(
@@ -79,7 +108,7 @@ export async function POST(req: Request) {
       );
     }
 
-    const order = await prisma.order.findFirst({
+    const order = (await prisma.order.findFirst({
       where: { paymentReference: reference },
       include: {
         items: {
@@ -90,9 +119,7 @@ export async function POST(req: Request) {
         },
         delivery: true,
       },
-    });
-
-    console.log("Order found:", !!order);
+    })) as OrderForPaymentWebhook | null;
 
     if (!order) {
       return NextResponse.json(
@@ -101,28 +128,34 @@ export async function POST(req: Request) {
       );
     }
 
-    // Prevent double processing
     if (order.paymentStatus === "PAID") {
-      console.log("⚠️ Order already processed");
+      if (order.deliveryQuoteId) {
+        const vendorOrderResult = await prepareMarketplaceOrderForVendors(order.id);
+        return NextResponse.json(
+          {
+            ok: true,
+            message: "Already processed. Marketplace vendor orders confirmed.",
+            vendorOrders: vendorOrderResult,
+          },
+          { status: 200 }
+        );
+      }
+
       return NextResponse.json(
         { ok: true, message: "Already processed" },
         { status: 200 }
       );
     }
 
-    console.log("Processing payment for order:", order.id);
-
-    // Deduct stock + mark order paid
     await prisma.$transaction(async (tx) => {
       for (const item of order.items) {
-        const pv = item.productVariant;
+        const variant = item.productVariant;
 
-        if (!pv) continue;
-        if (pv.stockQty == null) continue;
+        if (!variant || variant.stockQty === null) continue;
 
         const updated = await tx.productVariant.updateMany({
           where: {
-            id: pv.id,
+            id: variant.id,
             stockQty: { gte: item.quantity },
           },
           data: {
@@ -134,7 +167,7 @@ export async function POST(req: Request) {
 
         if (updated.count !== 1) {
           throw new Error(
-            `Insufficient stock for ${item.product?.name ?? "product"}`
+            `Insufficient stock for ${item.product?.name ?? "product"} - ${variant.name}`
           );
         }
       }
@@ -149,17 +182,24 @@ export async function POST(req: Request) {
       });
     });
 
-    console.log("✅ Order marked as PAID");
+    if (order.deliveryQuoteId) {
+      const vendorOrderResult = await prepareMarketplaceOrderForVendors(order.id);
+
+      return NextResponse.json(
+        {
+          ok: true,
+          message:
+            "Payment confirmed. Marketplace order is waiting for vendors to mark packages ready for pickup.",
+          vendorOrders: vendorOrderResult,
+        },
+        { status: 200 }
+      );
+    }
 
     const now = new Date();
-
     const withinWindow = isWithinDeliveryWindow(now);
 
-    console.log("Within delivery window:", withinWindow);
-
     if (withinWindow) {
-      console.log("🚚 Auto dispatching delivery");
-
       await prisma.delivery.upsert({
         where: { orderId: order.id },
         update: {
@@ -179,8 +219,6 @@ export async function POST(req: Request) {
 
       await createDeliveryFromOrder(order.id);
 
-      console.log("✅ KWIK delivery created");
-
       return NextResponse.json(
         {
           ok: true,
@@ -189,9 +227,6 @@ export async function POST(req: Request) {
         { status: 200 }
       );
     }
-
-    // Outside delivery window
-    console.log("📦 Queueing delivery (outside delivery window)");
 
     const scheduledDispatchAt = getNextDeliveryWindowStart(now);
 
@@ -214,30 +249,24 @@ export async function POST(req: Request) {
       },
     });
 
-    console.log("📅 Delivery queued for:", scheduledDispatchAt);
-
     return NextResponse.json(
       {
         ok: true,
-        message:
-          "Payment confirmed. Order queued for manual dispatch in the next delivery window.",
+        message: "Payment confirmed. Order queued for the next delivery window.",
         scheduledDispatchAt,
       },
       { status: 200 }
     );
   } catch (err: unknown) {
-    console.error("❌ PAYSTACK WEBHOOK ERROR:", err);
+    console.error("PAYSTACK_WEBHOOK_ERROR", err);
 
     const message =
       err instanceof Error
         ? err.message
         : typeof err === "string"
-        ? err
-        : "Something went wrong";
+          ? err
+          : "Something went wrong";
 
-    return NextResponse.json(
-      { ok: false, message },
-      { status: 400 }
-    );
+    return NextResponse.json({ ok: false, message }, { status: 400 });
   }
 }

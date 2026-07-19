@@ -1,14 +1,11 @@
-import { NextResponse } from "next/server";
+import { NextResponse, type NextRequest } from "next/server";
 import { cookies } from "next/headers";
 import { z } from "zod";
-import { customAlphabet } from "nanoid";
-import { prisma } from "@/lib/prisma";
 import { verifyAuthToken } from "@/lib/auth";
-import { priceCart } from "@/lib/checkout/priceCart";
-
-const nanoid = customAlphabet("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ", 10);
+import { createMarketplacePendingOrderFromQuote } from "@/lib/checkout/marketplaceCheckout";
 
 const BodySchema = z.object({
+  deliveryQuoteId: z.string().uuid(),
   items: z
     .array(
       z.object({
@@ -17,134 +14,71 @@ const BodySchema = z.object({
       })
     )
     .min(1),
-
   deliveryAddress1: z.string().min(3),
   deliveryAddress2: z.string().optional(),
   city: z.string().min(2),
   state: z.string().min(2),
   deliveryNote: z.string().optional(),
-
-  // ✅ REQUIRED for KWIK auto delivery
   deliveryLat: z.number(),
   deliveryLng: z.number(),
 });
 
-function makeOrderNumber() {
-  const d = new Date();
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `MAN-${y}${m}${day}-${nanoid()}`;
+function unauthorized() {
+  return NextResponse.json({ ok: false, message: "Unauthorized" }, { status: 401 });
 }
 
-export async function POST(req: Request) {
+export async function POST(req: NextRequest) {
   try {
     const body = BodySchema.parse(await req.json());
 
-    if (!Number.isFinite(body.deliveryLat) || !Number.isFinite(body.deliveryLng)) {
-      return NextResponse.json(
-        { ok: false, message: "deliveryLat and deliveryLng must be valid numbers" },
-        { status: 400 }
-      );
-    }
-
-    // ✅ Auth
     const cookieStore = await cookies();
     const token = cookieStore.get("manna_token")?.value;
+    if (!token) return unauthorized();
 
-    let userId: string | null = null;
-    if (token) {
-      const decoded = verifyAuthToken(token);
-      if (decoded?.userId) userId = decoded.userId;
-    }
+    const decoded = verifyAuthToken(token);
+    if (!decoded?.userId) return unauthorized();
 
-    // 1) Server pricing (discount-aware + stock checks)
-    const pricing = await priceCart(body.items);
-
-    // 2) Delivery fee (MVP = 0; later compute with KWIK pricing)
-    const deliveryFeeNgn = 0;
-
-    // 3) Transaction: re-check stock + create order + items
-    const order = await prisma.$transaction(async (tx) => {
-      const variants = await tx.productVariant.findMany({
-        where: { id: { in: body.items.map((i) => i.variantId) } },
-        include: { product: true },
-      });
-
-      const vmap = new Map(variants.map((v) => [v.id, v]));
-
-      for (const ci of body.items) {
-        const v = vmap.get(ci.variantId);
-        if (!v) throw new Error("Variant not found");
-
-        if (v.stockQty !== null && v.stockQty !== undefined) {
-          if (v.stockQty < ci.quantity) {
-            throw new Error(`Insufficient stock for ${v.product.name} - ${v.name}`);
-          }
-        }
-      }
-
-      return tx.order.create({
-        data: {
-          orderNumber: makeOrderNumber(),
-          userId,
-
-          status: "PENDING_PAYMENT",
-          paymentStatus: "PENDING",
-
-          totalAmountNgn: pricing.itemsTotalNgn + deliveryFeeNgn,
-          deliveryFeeNgn,
-
-          deliveryAddress1: body.deliveryAddress1,
-          deliveryAddress2: body.deliveryAddress2 ?? null,
-          city: body.city,
-          state: body.state,
-          deliveryNote: body.deliveryNote ?? null,
-
-          // ✅ persist coords for webhook auto-delivery
-          deliveryLat: body.deliveryLat,
-          deliveryLng: body.deliveryLng,
-
-          deliveryPartner: "KWIK",
-
-          items: {
-            create: pricing.items.map((i) => ({
-              productId: i.productId,
-              productVariantId: i.variantId,
-              quantity: i.quantity,
-
-              // Freeze discounted price
-              unitPriceNgn: i.finalUnitPriceNgn,
-              subtotalNgn: i.lineTotalNgn,
-            })),
-          },
-        },
-        include: { items: true },
-      });
+    const result = await createMarketplacePendingOrderFromQuote({
+      userId: decoded.userId,
+      deliveryQuoteId: body.deliveryQuoteId,
+      items: body.items,
+      deliveryAddress1: body.deliveryAddress1,
+      deliveryAddress2: body.deliveryAddress2,
+      city: body.city,
+      state: body.state,
+      deliveryNote: body.deliveryNote,
+      deliveryLat: body.deliveryLat,
+      deliveryLng: body.deliveryLng,
     });
 
     return NextResponse.json(
       {
         ok: true,
         order: {
-          id: order.id,
-          orderNumber: order.orderNumber,
-          status: order.status,
-          paymentStatus: order.paymentStatus,
-          totals: {
-            subtotalNgn: pricing.subtotalNgn,
-            discountTotalNgn: pricing.discountTotalNgn,
-            itemsTotalNgn: pricing.itemsTotalNgn,
-            deliveryFeeNgn,
-            totalAmountNgn: order.totalAmountNgn,
-          },
+          id: result.order.id,
+          orderNumber: result.order.orderNumber,
+          status: result.order.status,
+          paymentStatus: result.order.paymentStatus,
+          deliveryQuoteId: body.deliveryQuoteId,
+          totals: result.totals,
+        },
+        deliveryQuote: result.deliveryQuote,
+        pricing: {
+          currency: result.pricing.currency,
+          totals: result.totals,
+          items: result.pricing.items,
         },
       },
       { status: 201 }
     );
-  } catch (err: unknown) {
+  } catch (error: unknown) {
     const message =
-      err instanceof Error ? err.message : typeof err === "string" ? err : "Something went wrong";
+      error instanceof Error
+        ? error.message
+        : typeof error === "string"
+          ? error
+          : "Something went wrong";
+
     return NextResponse.json({ ok: false, message }, { status: 400 });
   }
 }

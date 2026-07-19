@@ -1,13 +1,24 @@
-import { NextResponse } from "next/server";
+import { NextResponse, type NextRequest } from "next/server";
 import { cookies } from "next/headers";
 import { prisma } from "@/lib/prisma";
 import { verifyAuthToken } from "@/lib/auth";
+import { isJsonObject } from "@/lib/marketplace/json";
 
 function unauthorized() {
   return NextResponse.json({ message: "Unauthorized" }, { status: 401 });
 }
 
-export async function POST(req: Request) {
+type ProductForCart = {
+  id: string;
+  marketClusterId: string | null;
+};
+
+type CartForCluster = {
+  id: string;
+  marketClusterId: string | null;
+};
+
+export async function POST(req: NextRequest) {
   try {
     const cookieStore = await cookies();
     const token = cookieStore.get("manna_token")?.value;
@@ -17,31 +28,57 @@ export async function POST(req: Request) {
     const decoded = verifyAuthToken(token);
     if (!decoded?.userId) return unauthorized();
 
-    const body = await req.json().catch(() => null);
-    const productId = body?.productId as string | undefined;
-    const productVariantId = (body?.productVariantId as string | null | undefined) ?? null;
-    const quantityRaw = body?.quantity;
+    const body: unknown = await req.json().catch(() => null);
 
-    const quantity = Number(quantityRaw ?? 1);
+    if (!isJsonObject(body)) {
+      return NextResponse.json(
+        { message: "Request body must be a JSON object" },
+        { status: 400 }
+      );
+    }
+
+    const productId = typeof body.productId === "string" ? body.productId : null;
+    const productVariantId =
+      typeof body.productVariantId === "string" ? body.productVariantId : null;
+    const quantity = Number(body.quantity ?? 1);
 
     if (!productId) {
-      return NextResponse.json({ message: "productId is required" }, { status: 400 });
-    }
-    if (!Number.isFinite(quantity) || quantity <= 0) {
-      return NextResponse.json({ message: "quantity must be a positive number" }, { status: 400 });
+      return NextResponse.json(
+        { message: "productId is required" },
+        { status: 400 }
+      );
     }
 
-    // Ensure product exists + active
-    const product = await prisma.product.findFirst({
-      where: { id: productId, isActive: true },
-      select: { id: true },
-    });
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      return NextResponse.json(
+        { message: "quantity must be a positive number" },
+        { status: 400 }
+      );
+    }
+
+    const product = (await prisma.product.findFirst({
+      where: {
+        id: productId,
+        isActive: true,
+        approvalStatus: "APPROVED",
+        OR: [
+          { vendorId: null },
+          { vendor: { status: "APPROVED", isActive: true, isVisible: true } },
+        ],
+      },
+      select: {
+        id: true,
+        marketClusterId: true,
+      },
+    })) as ProductForCart | null;
 
     if (!product) {
-      return NextResponse.json({ message: "Product not found" }, { status: 404 });
+      return NextResponse.json(
+        { message: "Product not found or not available" },
+        { status: 404 }
+      );
     }
 
-    // If variant provided, validate it belongs to product + stock
     if (productVariantId) {
       const variant = await prisma.productVariant.findFirst({
         where: { id: productVariantId, productId },
@@ -49,11 +86,17 @@ export async function POST(req: Request) {
       });
 
       if (!variant) {
-        return NextResponse.json({ message: "Variant not found for this product" }, { status: 404 });
+        return NextResponse.json(
+          { message: "Variant not found for this product" },
+          { status: 404 }
+        );
       }
 
-      // Optional stock check (recommended)
-      if (variant.stockQty !== null && variant.stockQty !== undefined && quantity > variant.stockQty) {
+      if (
+        variant.stockQty !== null &&
+        variant.stockQty !== undefined &&
+        quantity > variant.stockQty
+      ) {
         return NextResponse.json(
           { message: "Not enough stock for this variant" },
           { status: 400 }
@@ -61,16 +104,39 @@ export async function POST(req: Request) {
       }
     }
 
-    // Ensure cart exists
-    const cart = await prisma.cart.upsert({
+    const cart = (await prisma.cart.upsert({
       where: { userId: decoded.userId },
-      create: { userId: decoded.userId },
+      create: {
+        userId: decoded.userId,
+        marketClusterId: product.marketClusterId,
+      } as never,
       update: {},
-      select: { id: true },
-    });
+      select: {
+        id: true,
+        marketClusterId: true,
+      },
+    })) as CartForCluster;
 
-    // Because Postgres UNIQUE with nullable variantId can allow duplicates when variantId is null,
-    // we handle "variantId null" and "variantId not null" separately.
+    if (
+      product.marketClusterId &&
+      cart.marketClusterId &&
+      cart.marketClusterId !== product.marketClusterId
+    ) {
+      return NextResponse.json(
+        {
+          message:
+            "Your cart already contains items from another market cluster. Clear your cart before shopping from this cluster.",
+        },
+        { status: 409 }
+      );
+    }
+
+    if (product.marketClusterId && !cart.marketClusterId) {
+      await prisma.cart.update({
+        where: { id: cart.id },
+        data: { marketClusterId: product.marketClusterId } as never,
+      });
+    }
 
     const existing = await prisma.cartItem.findFirst({
       where: {
@@ -83,42 +149,76 @@ export async function POST(req: Request) {
       select: { id: true, quantity: true },
     });
 
-    let item;
-    if (existing) {
-      item = await prisma.cartItem.update({
-        where: { id: existing.id },
-        data: { quantity: existing.quantity + quantity },
-        select: {
-          id: true,
-          quantity: true,
-          product: { select: { id: true, name: true, slug: true, imageUrl: true } },
-          productVariant: { select: { id: true, name: true, unit: true, unitWeightKg: true, priceNgn: true, stockQty: true } },
-          updatedAt: true,
-          createdAt: true,
-        },
-      });
-    } else {
-      item = await prisma.cartItem.create({
-        data: {
-          cartId: cart.id,
-          productId,
-          productVariantId,
-          quantity,
-        },
-        select: {
-          id: true,
-          quantity: true,
-          product: { select: { id: true, name: true, slug: true, imageUrl: true } },
-          productVariant: { select: { id: true, name: true, unit: true, unitWeightKg: true, priceNgn: true, stockQty: true } },
-          updatedAt: true,
-          createdAt: true,
-        },
-      });
-    }
+    const item = existing
+      ? await prisma.cartItem.update({
+          where: { id: existing.id },
+          data: { quantity: existing.quantity + quantity },
+          select: {
+            id: true,
+            quantity: true,
+            product: {
+              select: {
+                id: true,
+                name: true,
+                slug: true,
+                imageUrl: true,
+                marketClusterId: true,
+              },
+            },
+            productVariant: {
+              select: {
+                id: true,
+                name: true,
+                unit: true,
+                unitWeightKg: true,
+                priceNgn: true,
+                stockQty: true,
+              },
+            },
+            updatedAt: true,
+            createdAt: true,
+          },
+        })
+      : await prisma.cartItem.create({
+          data: {
+            cartId: cart.id,
+            productId,
+            productVariantId,
+            quantity,
+          },
+          select: {
+            id: true,
+            quantity: true,
+            product: {
+              select: {
+                id: true,
+                name: true,
+                slug: true,
+                imageUrl: true,
+                marketClusterId: true,
+              },
+            },
+            productVariant: {
+              select: {
+                id: true,
+                name: true,
+                unit: true,
+                unitWeightKg: true,
+                priceNgn: true,
+                stockQty: true,
+              },
+            },
+            updatedAt: true,
+            createdAt: true,
+          },
+        });
 
     return NextResponse.json({ ok: true, item }, { status: 201 });
-  } catch (error) {
+  } catch (error: unknown) {
     console.error("CART_ADD_ITEM_ERROR", error);
-    return NextResponse.json({ message: "Something went wrong" }, { status: 500 });
+    return NextResponse.json(
+      { message: "Something went wrong" },
+      { status: 500 }
+    );
   }
 }

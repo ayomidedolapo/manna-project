@@ -3,6 +3,8 @@ import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { getActiveDiscounts, isDiscountEligibleForProduct, applyDiscountDetailed } from "@/services/discount.service";
 
+type ActiveDiscount = Awaited<ReturnType<typeof getActiveDiscounts>> extends Array<infer T> ? T : never;
+
 const BodySchema = z.object({
   items: z
     .array(
@@ -21,7 +23,7 @@ const BodySchema = z.object({
   deliveryNote: z.string().optional(),
 });
 
-function pickDiscountForProduct(discounts: any[], productId: string) {
+function pickDiscountForProduct(discounts: s[], productId: string) {
   const productSpecific = discounts.find(
     (d) => !d.appliesToAll && isDiscountEligibleForProduct(d, productId)
   );

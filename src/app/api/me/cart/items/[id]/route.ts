@@ -108,6 +108,17 @@ export async function DELETE(_req: Request, ctx: { params: Promise<{ id: string 
 
     await prisma.cartItem.delete({ where: { id: item.id } });
 
+    const remainingItems = await prisma.cartItem.count({
+      where: { cartId: cart.id },
+    });
+
+    if (remainingItems === 0) {
+      await prisma.cart.update({
+        where: { id: cart.id },
+        data: { marketClusterId: null } as never,
+      });
+    }
+
     return NextResponse.json({ ok: true }, { status: 200 });
   } catch (error) {
     console.error("CART_DELETE_ITEM_ERROR", error);

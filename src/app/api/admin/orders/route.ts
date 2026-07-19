@@ -19,7 +19,7 @@ export async function GET(req: Request) {
     const paymentStatus = url.searchParams.get("paymentStatus"); // PaymentStatus
     const q = (url.searchParams.get("q") || "").trim();
 
-    const where: any = {};
+    const where: Record<string, unknown> = {};
 
     if (status) where.status = status;
     if (paymentStatus) where.paymentStatus = paymentStatus;
@@ -34,7 +34,7 @@ export async function GET(req: Request) {
     }
 
     const [total, orders] = await prisma.$transaction([
-      prisma.order.count({ where }),
+      prisma.order.count({ where } as Parameters<typeof prisma.order.count>[0]),
       prisma.order.findMany({
         where,
         orderBy: { createdAt: "desc" },
@@ -61,9 +61,10 @@ export async function GET(req: Request) {
       totalPages: Math.ceil(total / pageSize),
       orders,
     });
-  } catch (err: any) {
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "list_orders_error";
     return Response.json(
-      { ok: false, error: err?.message ?? "list_orders_error" },
+      { ok: false, error: message },
       { status: 500 }
     );
   }

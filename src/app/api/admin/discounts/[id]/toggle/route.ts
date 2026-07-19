@@ -1,46 +1,84 @@
-import { NextResponse } from "next/server";
+import { NextResponse, type NextRequest } from "next/server";
 import { prisma } from "@/lib/prisma";
+
+type JsonObject = Record<string, unknown>;
+
+type DiscountScope = {
+  id: string;
+  appliesToAll: boolean;
+  productIds: unknown;
+};
+
+function isJsonObject(value: unknown): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function asStringArray(value: unknown): string[] | null {
+  if (value === null || value === undefined) return null;
+  if (!Array.isArray(value)) return null;
+
+  const cleaned = value
+    .map(String)
+    .map((item) => item.trim())
+    .filter(Boolean);
+
+  return cleaned.length ? cleaned : [];
+}
 
 function overlaps(a: string[] | null, b: string[] | null) {
   if (!a?.length || !b?.length) return false;
+
   const set = new Set(a);
-  return b.some((x) => set.has(x));
+  return b.some((item) => set.has(item));
 }
 
 export async function POST(
-  req: Request,
+  req: NextRequest,
   ctx: { params: Promise<{ id: string }> }
 ) {
   try {
     const { id } = await ctx.params;
-    const body = await req.json().catch(() => ({}));
-    const makeActive = body?.isActive === undefined ? true : Boolean(body.isActive);
+    const rawBody: unknown = await req.json().catch(() => ({}));
+
+    if (!isJsonObject(rawBody)) {
+      return NextResponse.json(
+        { message: "Request body must be a JSON object" },
+        { status: 400 }
+      );
+    }
+
+    const makeActive =
+      rawBody.isActive === undefined ? true : Boolean(rawBody.isActive);
 
     if (!makeActive) {
       const updated = await prisma.discount.update({
         where: { id },
         data: { isActive: false },
       });
+
       return NextResponse.json({ discount: updated });
     }
 
-    // Load the target discount scope
-    const target = await prisma.discount.findUnique({
+    const target = (await prisma.discount.findUnique({
       where: { id },
-      select: { id: true, appliesToAll: true, productIds: true },
-    });
+      select: {
+        id: true,
+        appliesToAll: true,
+        productIds: true,
+      },
+    })) as DiscountScope | null;
 
     if (!target) {
-      return NextResponse.json({ message: "Discount not found" }, { status: 404 });
+      return NextResponse.json(
+        { message: "Discount not found" },
+        { status: 404 }
+      );
     }
 
-    const targetIds = Array.isArray(target.productIds)
-      ? (target.productIds as unknown as string[])
-      : null;
-
+    const targetIds = asStringArray(target.productIds);
     const now = new Date();
 
-    const activeDiscounts = await prisma.discount.findMany({
+    const activeDiscounts = (await prisma.discount.findMany({
       where: {
         id: { not: id },
         isActive: true,
@@ -49,45 +87,60 @@ export async function POST(
           { OR: [{ endsAt: null }, { endsAt: { gte: now } }] },
         ],
       },
-      select: { id: true, appliesToAll: true, productIds: true },
-    });
+      select: {
+        id: true,
+        appliesToAll: true,
+        productIds: true,
+      },
+    })) as DiscountScope[];
 
     const disableIds: string[] = [];
 
     if (target.appliesToAll) {
-      // global discount should be exclusive
-      disableIds.push(...activeDiscounts.map((d) => d.id));
+      disableIds.push(
+        ...activeDiscounts.map((discount: DiscountScope) => discount.id)
+      );
     } else {
-      // disable global + overlapping product discounts
-      for (const d of activeDiscounts) {
-        if (d.appliesToAll) {
-          disableIds.push(d.id);
+      for (const discount of activeDiscounts) {
+        if (discount.appliesToAll) {
+          disableIds.push(discount.id);
           continue;
         }
-        const dIds = Array.isArray(d.productIds)
-          ? (d.productIds as unknown as string[])
-          : null;
 
-        if (overlaps(dIds, targetIds)) disableIds.push(d.id);
+        const discountIds = asStringArray(discount.productIds);
+
+        if (overlaps(discountIds, targetIds)) {
+          disableIds.push(discount.id);
+        }
       }
     }
 
-    const [, updated] = await prisma.$transaction([
-      disableIds.length
-        ? prisma.discount.updateMany({
-            where: { id: { in: disableIds } },
-            data: { isActive: false },
-          })
-        : prisma.discount.updateMany({ where: { id: { in: [] } }, data: { isActive: false } }),
-      prisma.discount.update({
-        where: { id },
-        data: { isActive: true },
-      }),
-    ]);
+    const updated =
+      disableIds.length > 0
+        ? (
+            await prisma.$transaction([
+              prisma.discount.updateMany({
+                where: { id: { in: disableIds } },
+                data: { isActive: false },
+              }),
+              prisma.discount.update({
+                where: { id },
+                data: { isActive: true },
+              }),
+            ])
+          )[1]
+        : await prisma.discount.update({
+            where: { id },
+            data: { isActive: true },
+          });
 
     return NextResponse.json({ discount: updated });
-  } catch (e) {
-    console.error("ADMIN_TOGGLE_DISCOUNT_ERROR", e);
-    return NextResponse.json({ message: "Something went wrong" }, { status: 500 });
+  } catch (error: unknown) {
+    console.error("ADMIN_TOGGLE_DISCOUNT_ERROR", error);
+
+    return NextResponse.json(
+      { message: "Something went wrong" },
+      { status: 500 }
+    );
   }
 }

@@ -1,5 +1,6 @@
 // app/api/cron/kwik-sync/route.ts
 import { prisma } from "@/lib/prisma";
+import type { Prisma } from "@prisma/client";
 import { getKwikJobStatus } from "@/services/kwikWebhook";
 import {
   canMoveForward,
@@ -36,7 +37,18 @@ export async function GET(req: Request) {
       orderBy: { updatedAt: "asc" },
     });
 
-    const results: any[] = [];
+    type ResultEntry = {
+      deliveryId: string | number;
+      ok: boolean;
+      jobId?: string;
+      jobStatus?: string;
+      mappedStatus?: string;
+      note?: string;
+      usedEndpoint?: string;
+      error?: string;
+    };
+
+    const results: ResultEntry[] = [];
 
     for (const d of deliveries) {
       const attempt = d.statusCheckAttempts ?? 0;
@@ -53,9 +65,9 @@ export async function GET(req: Request) {
 
         const shouldUpdateStatus =
           d.status !== newDeliveryStatus &&
-          canMoveForward(d.status as any, newDeliveryStatus as any);
+          canMoveForward(d.status, newDeliveryStatus);
 
-        const deliveryData: any = {
+        const deliveryData: Prisma.DeliveryUpdateInput = {
           kwikJobStatus: kwik.job_status,
           lastStatusCheckAt: new Date(),
           lastStatusCheckError: null,
@@ -116,14 +128,14 @@ export async function GET(req: Request) {
           deliveryId: d.id,
           ok: true,
           jobId,
-          jobStatus: kwik.job_status,
+          jobStatus: String(kwik.job_status),
           mappedStatus: shouldUpdateStatus ? newDeliveryStatus : d.status,
           note: shouldUpdateStatus
             ? undefined
             : "ignored_backward_or_terminal_transition",
           usedEndpoint: kwik.usedEndpoint,
         });
-      } catch (err: any) {
+      } catch (err: unknown) {
         // ✅ staging-safe fallback
         await prisma.delivery.update({
           where: { id: d.id },
@@ -144,10 +156,11 @@ export async function GET(req: Request) {
     }
 
     return Response.json({ ok: true, count: deliveries.length, results });
-  } catch (err: any) {
+  } catch (err: unknown) {
     console.error("KWIK_SYNC_ERROR:", err);
+    const message = err instanceof Error ? err.message : "sync_error";
     return Response.json(
-      { ok: false, error: err?.message ?? "sync_error" },
+      { ok: false, error: message },
       { status: 500 }
     );
   }
