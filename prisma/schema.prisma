@@ -135,6 +135,32 @@ enum KwikDeliveryTaskStatus {
   CANCELLED
 }
 
+enum MediaStorageProvider {
+  FIREBASE_STORAGE
+}
+
+enum MediaType {
+  IMAGE
+  VIDEO
+  FILE
+}
+
+enum MediaOwnerType {
+  PRODUCT
+  ORDER
+  VENDOR_ORDER
+  CUSTOMER_FEEDBACK
+  USER
+  SYSTEM
+}
+
+enum MediaApprovalStatus {
+  PENDING_REVIEW
+  APPROVED
+  REJECTED
+  DELETED
+}
+
 model User {
   id                    String    @id @default(uuid())
   name                  String
@@ -1159,5 +1185,55 @@ model CustomerFeedback {
   @@index([userId])
   @@index([rating])
   @@index([status])
+  @@index([createdAt])
+}
+
+model MediaAsset {
+  id String @id @default(uuid())
+
+  storageProvider MediaStorageProvider @default(FIREBASE_STORAGE)
+  bucket          String
+  storagePath     String @unique
+  downloadToken   String?
+  publicUrl       String?
+
+  mediaType        MediaType
+  purpose          String @default("GENERAL")
+  contentType      String
+  originalFilename String?
+  sizeBytes        Int?
+
+  ownerType MediaOwnerType
+  ownerId   String
+
+  productId      String?
+  vendorId       String?
+  orderId        String?
+  vendorOrderId  String?
+  feedbackId     String?
+  uploadedByUserId String?
+
+  approvalStatus   MediaApprovalStatus @default(PENDING_REVIEW)
+  approvedAt       DateTime?
+  approvedByAdminId String?
+  rejectedAt       DateTime?
+  rejectionReason  String?
+  deletedAt        DateTime?
+
+  metadata Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([storageProvider])
+  @@index([mediaType])
+  @@index([ownerType, ownerId])
+  @@index([productId])
+  @@index([vendorId])
+  @@index([orderId])
+  @@index([vendorOrderId])
+  @@index([feedbackId])
+  @@index([uploadedByUserId])
+  @@index([approvalStatus])
   @@index([createdAt])
 }

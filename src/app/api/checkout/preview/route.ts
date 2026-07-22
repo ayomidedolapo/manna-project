@@ -23,7 +23,7 @@ const BodySchema = z.object({
   deliveryNote: z.string().optional(),
 });
 
-function pickDiscountForProduct(discounts: s[], productId: string) {
+function pickDiscountForProduct(discounts: ActiveDiscount[], productId: string) {
   const productSpecific = discounts.find(
     (d) => !d.appliesToAll && isDiscountEligibleForProduct(d, productId)
   );
